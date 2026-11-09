@@ -1,0 +1,53 @@
+# cloud-sim-vk.txt - the cloud simulator layer's settings for DOOM (2016).
+# The layer reads this file at the start and again whenever it changes (twice a second).
+# sim_mode / sim_latency act when their value here changes, so F6 / F7 choices survive other edits;
+# sim_record_now / sim_snapshot_now start a recording / a snapshot when their number goes up
+# (run_doom.ps1 -Record / -Snapshot does that).
+sim=1
+sim_mode=0
+sim_latency=50
+sim_keep=0.92
+sim_slots=32
+sim_logger=1
+# the mouse -> camera model: fit_doom.py on rec-20261108-045359 (R^2 yaw 0.979, pitch 0.986, miss
+# 0.42 px a frame median; rec-...043729 agrees: hfov 98.3, yaw 0.0566 / pitch 0.0630 deg a count); roll 0
+sim_cx=0 -1.0716e-03 0
+sim_cy=1.1263e-03 0 0
+sim_tau_ms=22
+sim_lag_ms=6.5
+sim_hfov=99.4
+# the depth buffer: followed and copied; the weapon nearer than sim_weapon_depth stays on the screen
+# (snap-20261108-044135: weapon 0.075-0.093, world from 0.974)
+sim_depth=1
+sim_depth_reversed=auto
+sim_weapon_depth=0.6
+# screen-locked (snap-20261108-045358): health and armour bottom left, ammunition bottom right,
+# and the game's black bars, 54 px (5 %) at the top (the FPS line is in it) and at the bottom
+sim_lock1=0.0 0.84 0.27 0.97
+sim_lock2=0.75 0.84 1.0 0.97
+sim_lock3=0.0 0.0 1.0 0.05
+sim_lock4=0.0 0.95 1.0 1.0
+# the box at the centre left out (the game's crosshair) and the layer's own crosshair, shares of height
+sim_hole=0.028
+sim_cross=0.012
+sim_rec_frames=900
+# recordings and snapshots go to sim_rec_dir=<folder>, by default %USERPROFILE%\datasets\doom-rec
+sim_snapshot_now=1
+# holes the old frame turned away from: first from older frames in the ring (0: blur only)
+sim_history=1
+# the network: jitter on the delay (ms, a correlated random walk) and the share of frames lost
+sim_jitter_ms=0
+sim_loss=0
+# the camera's move from WASD (splat path with parallax): off until fit_move.py on a demo recording
+# with walking (Insert) gives the speed (near-plane units a second), tau and lag
+sim_move=0
+sim_move_speed=0
+sim_move_tau_ms=-1
+sim_move_lag_ms=0
+# the demo recording (Insert): half-size colour + nearness + keys, for demo_doom.py and fit_move.py
+sim_demo_frames=450
+# the GPU time of each of the layer's dispatches in the log, every 5 s (a timestamp after each)
+sim_profile=1
+# the gamepad's right stick -> camera: off until after_pad.ps1 (fit_pad.py) on a recording (End)
+# made turning with the stick; then sim_pad=1 and the tables, tau and lag from the fit
+sim_pad=0

@@ -1,0 +1,458 @@
+#version 450
+// sim.comp - the kernels of the cloud simulator layer (cloud_sim_vk.c), one per KERNEL:
+//   1 bwarp    the screen from an old frame: each pixel looks up where it was before the camera
+//              turned. In first person the camera turns about the eye, so a rotation moves every
+//              pixel the same way whatever its depth (a homography): no splatting, no holes inside.
+//              Depth only tells the weapon from the world: pixels nearer than `lockz` (and the
+//              screen-locked rectangles, the HUD) stay where they are on the screen, and what the
+//              weapon hid in the old frame becomes a hole. The game's own crosshair (a box at the
+//              centre) is left out too: the layer draws its own on top.
+//   2 pdown    fill pyramid, down: each 2x2 keeps its farthest valid pixel (background into holes)
+//   3 pfill    the coarsest level's holes from the nearest valid pixel (one thread)
+//   4 pup      fill pyramid, up: a level's holes from the coarser one, bilinear
+//   5 zoom     the central `keep` of the frame onto the whole screen (a margin for turns)
+//   6 overlay  the crosshair (kind 1) and the corner mark (kind 2: red cloud, green warp)
+//   7 luma     a quarter-size 8-bit luma of the game's frame, for the recording
+//   8 dstat    a 64x40 grid of the raw depth, for the log
+//   9 half     a half-size frame (2x2 mean, raw RGBA8/BGRA8) and its nearness (the nearest of the
+//              2x2, 16-bit: 0 at the camera, 65535 far, whatever the depth's convention), for the
+//              demo recording
+//  10 clear    the z-buffer to holes (splat path)
+//  11 splatz   the splat path, when the camera also moved (sim_move): each old pixel goes where it
+//              is now, P' = R (P - T), its distance from the depth (z = n / (1 - d)), each over 2x2,
+//              the nearest winning (atomicMin on the distance's bits); the weapon and the HUD stay
+//  12 splatc   the colour of the pixel that won each target
+//  13 hfill    a hole from an older frame (lv.x: which of HC's three), turned to now the same way:
+//              a turn back and forth shows again what the newest old frame had turned away from
+// Colour is 4 bytes a pixel (RGBA8 or BGRA8, raw); keys order depth, farther = larger, and a
+// hole's key is 0xFFFFFFFF.
+#ifndef KERNEL
+#define KERNEL 1
+#endif
+#if KERNEL == 3
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#endif
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };   // a ring frame's colour
+layout(std430, set = 0, binding = 1) readonly buffer Dep { uint dep[]; };   // its raw depth
+layout(std430, set = 0, binding = 2) buffer Zb { uint zb[]; };              // a level's keys
+layout(std430, set = 0, binding = 3) buffer Dst { uint dst[]; };            // a level's colour
+layout(std430, set = 0, binding = 4) buffer Zc { uint zc[]; };              // the coarser level's keys
+layout(std430, set = 0, binding = 5) buffer Cc { uint cc[]; };              // its colour / the screen
+layout(std140, set = 0, binding = 6) uniform Params {   // std140 = std430 here: only 16-byte members and arrays
+	vec4 C0, C1, C2;            // R^T by rows: the ray a screen pixel had in the old frame
+	float f, cx, cy, keep;
+	uint W, H, RW, RH;          // the screen; the depth
+	uint mark, dflags, lockz, bgra;   // dflags: 1 24-bit, 2 reversed, 4 16-bit
+	uint hole, cross, nlock, depth_ok;
+	uvec4 lock[4];              // x0 y0 x1 y1, pixels
+	vec4 T;                     // the camera's move in the old frame's axes, in near-plane units (splat)
+	vec4 HC[9];                 // older frames for the holes: R'^T by rows, three frames
+} p;
+layout(std430, set = 0, binding = 7) buffer Rec { uint rec[]; };            // host-visible readback
+layout(push_constant) uniform Push { uvec4 lv; } pc;
+
+uint raw_at(uint i, uint flags) {
+	if ((flags & 4u) != 0u) return (dep[i >> 1u] >> ((i & 1u) * 16u)) & 0xFFFFu;
+	return dep[i];
+}
+
+uint key_of(uint raw) {
+	bool rev = (p.dflags & 2u) != 0u;
+	if ((p.dflags & 4u) != 0u) return rev ? 0xFFFFu - raw : raw;
+	if ((p.dflags & 1u) != 0u) {
+		uint v = raw & 0xFFFFFFu;
+		return rev ? 0xFFFFFFu - v : v;
+	}
+	float d = uintBitsToFloat(raw);
+	if (!(d >= 0.0)) d = 0.0;          // NaN, negative
+	d = min(d, 1.0);
+	if (rev) d = 1.0 - d;
+	return floatBitsToUint(d);
+}
+
+// the depth pixel under screen pixel (x, y): the same one when the depth has the screen's size
+uint depth_index(uint x, uint y) {
+	if (p.RW == p.W && p.RH == p.H) return y * p.W + x;
+	uint rx = min(x * p.RW / p.W, p.RW - 1u), ry = min(y * p.RH / p.H, p.RH - 1u);
+	return ry * p.RW + rx;
+}
+
+uint dkey(uint x, uint y) {
+	if (p.depth_ok == 0u) return 0x3F000000u;
+	return key_of(raw_at(depth_index(x, y), p.dflags));
+}
+
+bool in_rects(uint x, uint y) {
+	uint n = min(p.nlock, 4u);
+	for (uint i = 0u; i < n; i++) {
+		uvec4 r = p.lock[i];
+		if (x >= r.x && y >= r.y && x < r.z && y < r.w) return true;
+	}
+	return false;
+}
+
+bool in_hole(uint x, uint y) {
+	if (p.hole == 0u) return false;
+	float fx = abs(float(x) + 0.5 - float(p.W) * 0.5), fy = abs(float(y) + 0.5 - float(p.H) * 0.5);
+	return fx < float(p.hole) && fy < float(p.hole);
+}
+
+// the old frame (src, dep) at s (pixel-centre units), bilinear over the taps that saw the world (not
+// the weapon, a rectangle or the centre box); false when they hold less than half the weight
+bool sample_world(vec2 s, out uint col, out uint key) {
+	vec2 b = floor(s);
+	vec2 w = s - b;
+	ivec2 b0 = ivec2(b);
+	uint x0 = uint(clamp(b0.x, 0, int(p.W) - 1)), x1 = uint(clamp(b0.x + 1, 0, int(p.W) - 1));
+	uint y0 = uint(clamp(b0.y, 0, int(p.H) - 1)), y1 = uint(clamp(b0.y + 1, 0, int(p.H) - 1));
+	vec4 acc = vec4(0.0);
+	float wsum = 0.0;
+	uint kmax = 0u;
+	for (int j = 0; j < 2; j++) {
+		for (int i = 0; i < 2; i++) {
+			float wi = (i == 0 ? 1.0 - w.x : w.x) * (j == 0 ? 1.0 - w.y : w.y);
+			if (wi <= 0.0) continue;
+			uint x = i == 0 ? x0 : x1, y = j == 0 ? y0 : y1;
+			if (in_hole(x, y) || in_rects(x, y)) continue;
+			uint k = dkey(x, y);
+			if (k < p.lockz) continue;            // the weapon there: the old frame never saw behind it
+			acc += wi * unpackUnorm4x8(src[y * p.W + x]);
+			wsum += wi;
+			kmax = max(kmax, k);
+		}
+	}
+	col = wsum >= 0.5 ? packUnorm4x8(acc / wsum) : 0u;
+	key = kmax;
+	return wsum >= 0.5;
+}
+
+#if KERNEL == 1
+void main() {
+	uvec2 q = gl_GlobalInvocationID.xy;
+	if (q.x >= p.W || q.y >= p.H) return;
+	uint o = q.y * p.W + q.x;
+	bool rect = in_rects(q.x, q.y);
+	uint kq = dkey(q.x, q.y);
+	uint col = 0u, key = 0xFFFFFFFFu;         // a hole unless the old frame saw the world there
+	if ((rect || kq < p.lockz) && !in_hole(q.x, q.y)) {   // on the screen, not in the world
+		col = src[o];
+		key = rect ? 0u : kq;
+	} else {
+		vec3 Q = vec3((float(q.x) + 0.5 - p.cx) / p.f, (float(q.y) + 0.5 - p.cy) / p.f, 1.0);
+		vec3 P = vec3(dot(p.C0.xyz, Q), dot(p.C1.xyz, Q), dot(p.C2.xyz, Q));
+		vec2 s = vec2(P.x / P.z * p.f + p.cx, P.y / P.z * p.f + p.cy) - 0.5;   // in pixel-centre units
+		uint c2, k2;
+		if (P.z > 1e-3 && s.x > -0.5 && s.y > -0.5 && s.x < float(p.W) - 0.5 && s.y < float(p.H) - 0.5 && sample_world(s, c2, k2)) {
+			col = c2;
+			key = k2;
+		}
+	}
+	dst[o] = col;
+	zb[o] = key;
+}
+#endif
+
+#if KERNEL == 2
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	uint Wf = pc.lv.x, Hf = pc.lv.y, Wc = pc.lv.z, Hc = pc.lv.w;
+	if (id.x >= Wc || id.y >= Hc) return;
+	uint bestk = 0xFFFFFFFFu, bi = 0u;
+	bool any = false;
+	for (uint dy = 0u; dy < 2u; dy++) {
+		for (uint dx = 0u; dx < 2u; dx++) {
+			uint x = min(id.x * 2u + dx, Wf - 1u), y = min(id.y * 2u + dy, Hf - 1u);
+			uint i = y * Wf + x;
+			uint k = zb[i];
+			bool valid = k != 0xFFFFFFFFu;
+			if (valid && (!any || k > bestk)) {
+				bestk = k;
+				bi = i;
+			}
+			any = any || valid;
+		}
+	}
+	uint o = id.y * Wc + id.x;
+	zc[o] = any ? bestk : 0xFFFFFFFFu;
+	cc[o] = any ? dst[bi] : 0u;
+}
+#endif
+
+#if KERNEL == 3
+void main() {
+	uint Wc = pc.lv.z, Hc = pc.lv.w;
+	for (uint y = 0u; y < Hc; y++) {
+		for (uint x = 0u; x < Wc; x++) {
+			uint o = y * Wc + x;
+			if (zc[o] != 0xFFFFFFFFu) continue;
+			uint bo = 0u, bk = 0xFFFFFFFFu;
+			float bd = 1e30;
+			for (uint v = 0u; v < Hc; v++) {
+				for (uint u = 0u; u < Wc; u++) {
+					uint k = zc[v * Wc + u];
+					float d = (float(u) - float(x)) * (float(u) - float(x)) + (float(v) - float(y)) * (float(v) - float(y));
+					if (k != 0xFFFFFFFFu && d < bd) {
+						bd = d;
+						bo = v * Wc + u;
+						bk = k;
+					}
+				}
+			}
+			cc[o] = bd < 1e30 ? cc[bo] : 0xFF000000u;
+			zc[o] = bd < 1e30 ? bk : 0x7F000000u;
+		}
+	}
+}
+#endif
+
+#if KERNEL == 4
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	uint Wf = pc.lv.x, Hf = pc.lv.y, Wc = pc.lv.z, Hc = pc.lv.w;
+	if (id.x >= Wf || id.y >= Hf) return;
+	uint o = id.y * Wf + id.x;
+	if (zb[o] != 0xFFFFFFFFu) return;
+	vec2 c = clamp((vec2(id) + 0.5) * vec2(Wc, Hc) / vec2(Wf, Hf) - 0.5, vec2(0.0), vec2(Wc - 1u, Hc - 1u));
+	uvec2 p0 = uvec2(c), p1 = min(p0 + 1u, uvec2(Wc - 1u, Hc - 1u));
+	vec2 w = c - vec2(p0);
+	vec4 a = unpackUnorm4x8(cc[p0.y * Wc + p0.x]), b = unpackUnorm4x8(cc[p0.y * Wc + p1.x]);
+	vec4 e = unpackUnorm4x8(cc[p1.y * Wc + p0.x]), g = unpackUnorm4x8(cc[p1.y * Wc + p1.x]);
+	dst[o] = packUnorm4x8(mix(mix(a, b, w.x), mix(e, g, w.x), w.y));
+	uvec2 m = min(uvec2(c + 0.5), uvec2(Wc - 1u, Hc - 1u));
+	zb[o] = zc[m.y * Wc + m.x];
+}
+#endif
+
+#if KERNEL == 5
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x >= p.W || id.y >= p.H) return;
+	vec2 cen = vec2(p.W, p.H) * 0.5;
+	vec2 s = clamp((vec2(id) + 0.5 - cen) * p.keep + cen - 0.5, vec2(0.0), vec2(p.W - 1u, p.H - 1u));
+	uvec2 p0 = uvec2(s), p1 = min(p0 + 1u, uvec2(p.W - 1u, p.H - 1u));
+	vec2 w = s - vec2(p0);
+	vec4 a = unpackUnorm4x8(dst[p0.y * p.W + p0.x]), b = unpackUnorm4x8(dst[p0.y * p.W + p1.x]);
+	vec4 e = unpackUnorm4x8(dst[p1.y * p.W + p0.x]), g = unpackUnorm4x8(dst[p1.y * p.W + p1.x]);
+	cc[id.y * p.W + id.x] = packUnorm4x8(mix(mix(a, b, w.x), mix(e, g, w.x), w.y));
+}
+#endif
+
+#if KERNEL == 6
+uint rgb(uint r, uint g, uint b) {
+	return p.bgra != 0u ? (0xFF000000u | (r << 16) | (g << 8) | b) : (0xFF000000u | (b << 16) | (g << 8) | r);
+}
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x >= pc.lv.w || id.y >= pc.lv.w) return;
+	uint x = pc.lv.x + id.x, y = pc.lv.y + id.y;
+	if (x >= p.W || y >= p.H) return;
+	uint o = y * p.W + x;
+	if (pc.lv.z == 2u) {
+		cc[o] = p.mark == 1u ? rgb(230u, 30u, 30u) : rgb(30u, 220u, 60u);
+		return;
+	}
+	float fx = abs(float(x) + 0.5 - float(p.W) * 0.5), fy = abs(float(y) + 0.5 - float(p.H) * 0.5);
+	float arm = float(p.cross), gap = max(floor(arm * 0.3), 2.0), th = max(floor(arm * 0.12), 1.0);
+	bool on = (fy < th && fx >= gap && fx <= arm) || (fx < th && fy >= gap && fy <= arm) || (fx < th && fy < th);
+	bool rim = (fy < th + 1.0 && fx >= gap - 1.0 && fx <= arm + 1.0) || (fx < th + 1.0 && fy >= gap - 1.0 && fy <= arm + 1.0)
+		|| (fx < th + 1.0 && fy < th + 1.0);
+	if (on) cc[o] = rgb(255u, 255u, 255u);
+	else if (rim) cc[o] = rgb(0u, 0u, 0u);
+}
+#endif
+
+#if KERNEL == 7
+void main() {
+	uint lw = p.W / 4u, lh = p.H / 4u, wpr = (lw + 3u) / 4u;
+	uvec2 id = gl_GlobalInvocationID.xy;            // x: a word of 4 output pixels; y: an output row
+	if (id.x >= wpr || id.y >= lh) return;
+	uint word = 0u;
+	for (uint b = 0u; b < 4u; b++) {
+		uint ox = id.x * 4u + b;
+		uint v = 0u;
+		if (ox < lw) {
+			float sum = 0.0;
+			for (uint yy = 0u; yy < 4u; yy++) {
+				for (uint xx = 0u; xx < 4u; xx++) {
+					vec4 c = unpackUnorm4x8(src[(id.y * 4u + yy) * p.W + ox * 4u + xx]);
+					vec3 c3 = p.bgra != 0u ? c.zyx : c.xyz;
+					sum += dot(c3, vec3(0.299, 0.587, 0.114));
+				}
+			}
+			v = uint(clamp(sum / 16.0 * 255.0 + 0.5, 0.0, 255.0));
+		}
+		word |= v << (8u * b);
+	}
+	rec[pc.lv.x + id.y * wpr + id.x] = word;
+}
+#endif
+
+#if KERNEL >= 10
+// standard depth d = 1 - n/z (infinite far): z/n = 1 / (1 - d); a reversed one is turned first
+float zeta(uint x, uint y) {
+	if (p.depth_ok == 0u) return 1e6;
+	uint raw = raw_at(depth_index(x, y), p.dflags);
+	float d;
+	if ((p.dflags & 4u) != 0u) d = float(raw & 0xFFFFu) / 65535.0;
+	else if ((p.dflags & 1u) != 0u) d = float(raw & 0xFFFFFFu) / 16777215.0;
+	else d = clamp(uintBitsToFloat(raw), 0.0, 1.0);
+	if ((p.dflags & 2u) != 0u) d = 1.0 - d;
+	return 1.0 / max(1.0 - d, 1e-6);
+}
+// where old pixel (x, y) is now; key: the new distance's bits (0 and 1: screen-locked, nearest)
+bool target_move(uint x, uint y, out vec2 t, out uint key, out bool locked) {
+	t = vec2(0.0);
+	key = 0xFFFFFFFFu;
+	locked = false;
+	if (in_hole(x, y)) return false;
+	if (in_rects(x, y)) {
+		locked = true;
+		key = 0u;
+		t = vec2(x, y) + 0.5;
+		return true;
+	}
+	if (dkey(x, y) < p.lockz) {
+		locked = true;
+		key = 1u;
+		t = vec2(x, y) + 0.5;
+		return true;
+	}
+	float z = zeta(x, y);
+	vec3 P = vec3((float(x) + 0.5 - p.cx) / p.f * z, (float(y) + 0.5 - p.cy) / p.f * z, z) - p.T.xyz;
+	// R from R^T's rows: row i of R is (C0[i], C1[i], C2[i])
+	vec3 Q = vec3(dot(vec3(p.C0.x, p.C1.x, p.C2.x), P), dot(vec3(p.C0.y, p.C1.y, p.C2.y), P),
+		      dot(vec3(p.C0.z, p.C1.z, p.C2.z), P));
+	if (!(Q.z > 1e-3)) return false;
+	t = vec2(Q.x / Q.z * p.f + p.cx, Q.y / Q.z * p.f + p.cy);
+	key = max(floatBitsToUint(Q.z), 2u);
+	return t.x > -2.0 && t.y > -2.0 && t.x < float(p.W) + 2.0 && t.y < float(p.H) + 2.0;
+}
+#endif
+
+#if KERNEL == 10
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x >= p.W || id.y >= p.H) return;
+	zb[id.y * p.W + id.x] = 0xFFFFFFFFu;
+}
+#endif
+
+#if KERNEL == 11
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x >= p.W || id.y >= p.H) return;
+	vec2 t;
+	uint key;
+	bool locked;
+	if (!target_move(id.x, id.y, t, key, locked)) return;
+	if (locked) {
+		atomicMin(zb[id.y * p.W + id.x], key);
+		return;
+	}
+	int x0 = int(floor(t.x - 0.5)), y0 = int(floor(t.y - 0.5));
+	for (int dy = 0; dy < 2; dy++) {
+		for (int dx = 0; dx < 2; dx++) {
+			int xi = x0 + dx, yi = y0 + dy;
+			if (xi < 0 || yi < 0 || xi >= int(p.W) || yi >= int(p.H)) continue;
+			atomicMin(zb[uint(yi) * p.W + uint(xi)], key);
+		}
+	}
+}
+#endif
+
+#if KERNEL == 12
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x >= p.W || id.y >= p.H) return;
+	vec2 t;
+	uint key;
+	bool locked;
+	if (!target_move(id.x, id.y, t, key, locked)) return;
+	uint from = id.y * p.W + id.x;
+	if (locked) {
+		if (zb[from] == key) dst[from] = src[from];
+		return;
+	}
+	int x0 = int(floor(t.x - 0.5)), y0 = int(floor(t.y - 0.5));
+	for (int dy = 0; dy < 2; dy++) {
+		for (int dx = 0; dx < 2; dx++) {
+			int xi = x0 + dx, yi = y0 + dy;
+			if (xi < 0 || yi < 0 || xi >= int(p.W) || yi >= int(p.H)) continue;
+			uint to = uint(yi) * p.W + uint(xi);
+			if (zb[to] == key) dst[to] = src[from];
+		}
+	}
+}
+#endif
+
+#if KERNEL == 13
+void main() {
+	uvec2 q = gl_GlobalInvocationID.xy;
+	if (q.x >= p.W || q.y >= p.H) return;
+	uint o = q.y * p.W + q.x;
+	if (zb[o] != 0xFFFFFFFFu) return;
+	uint hi = min(pc.lv.x, 2u) * 3u;
+	vec3 Q = vec3((float(q.x) + 0.5 - p.cx) / p.f, (float(q.y) + 0.5 - p.cy) / p.f, 1.0);
+	vec3 P = vec3(dot(p.HC[hi].xyz, Q), dot(p.HC[hi + 1u].xyz, Q), dot(p.HC[hi + 2u].xyz, Q));
+	vec2 s = vec2(P.x / P.z * p.f + p.cx, P.y / P.z * p.f + p.cy) - 0.5;
+	uint col, key;
+	if (!(P.z > 1e-3 && s.x > -0.5 && s.y > -0.5 && s.x < float(p.W) - 0.5 && s.y < float(p.H) - 0.5 && sample_world(s, col, key)))
+		return;
+	dst[o] = col;
+	zb[o] = max(key, 1u);
+}
+#endif
+
+#if KERNEL == 9
+// lv.x: the colour's word offset in rec; lv.y: depth ok | flags << 8; lv.z: RW | RH << 16; lv.w: the
+// nearness's word offset. One thread, two output pixels (one 32-bit word of nearness).
+float near_at(uint x, uint y, uint ok, uint flags, uint rw, uint rh) {
+	if (ok == 0u) return 1.0;
+	uint rx = min(x * rw / p.W, rw - 1u), ry = min(y * rh / p.H, rh - 1u);
+	uint raw = raw_at(ry * rw + rx, flags);
+	float d;
+	if ((flags & 4u) != 0u) d = float(raw & 0xFFFFu) / 65535.0;
+	else if ((flags & 1u) != 0u) d = float(raw & 0xFFFFFFu) / 16777215.0;
+	else d = clamp(uintBitsToFloat(raw), 0.0, 1.0);
+	return (flags & 2u) != 0u ? 1.0 - d : d;
+}
+void main() {
+	uint hw = p.W / 2u, hh = p.H / 2u;
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x * 2u >= hw || id.y >= hh) return;
+	uint ok = pc.lv.y & 0xFFu, flags = pc.lv.y >> 8u, rw = pc.lv.z & 0xFFFFu, rh = pc.lv.z >> 16u;
+	uint word = 0u;
+	for (uint b = 0u; b < 2u; b++) {
+		uint ox = id.x * 2u + b;
+		vec4 c = vec4(0.0);
+		float nmin = 1.0;
+		for (uint yy = 0u; yy < 2u; yy++) {
+			for (uint xx = 0u; xx < 2u; xx++) {
+				uint sx = ox * 2u + xx, sy = id.y * 2u + yy;
+				c += unpackUnorm4x8(src[sy * p.W + sx]);
+				nmin = min(nmin, near_at(sx, sy, ok, flags, rw, rh));
+			}
+		}
+		rec[pc.lv.x + id.y * hw + ox] = packUnorm4x8(c * 0.25);
+		word |= uint(clamp(nmin * 65535.0 + 0.5, 0.0, 65535.0)) << (16u * b);
+	}
+	rec[pc.lv.w + id.y * (hw / 2u) + id.x] = word;
+}
+#endif
+
+#if KERNEL == 8
+void main() {
+	uvec2 id = gl_GlobalInvocationID.xy;
+	if (id.x >= 64u || id.y >= 40u) return;
+	uint rw = pc.lv.z & 0xFFFFu, rh = pc.lv.z >> 16u;
+	uint v = 0xFFFFFFFFu;
+	if (pc.lv.y != 0u && rw != 0u && rh != 0u) {
+		uint rx = min((id.x * 2u + 1u) * rw / 128u, rw - 1u), ry = min((id.y * 2u + 1u) * rh / 80u, rh - 1u);
+		v = raw_at(ry * rw + rx, pc.lv.w);
+	}
+	rec[pc.lv.x + id.y * 64u + id.x] = v;
+}
+#endif

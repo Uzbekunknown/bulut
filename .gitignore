@@ -1,0 +1,12 @@
+# made by doom\layer\build.bat; the settings file is kept
+doom/layer/build/*
+!doom/layer/build/cloud-sim-vk.txt
+
+# what the scripts write
+doom/results/
+doom/demo_text_*.txt
+*.mp4
+*.log
+*.before-*
+__pycache__/
+*.pyc

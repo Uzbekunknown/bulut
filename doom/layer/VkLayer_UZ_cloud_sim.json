@@ -1,0 +1,14 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_UZ_cloud_sim",
+    "type": "GLOBAL",
+    "library_path": ".\\cloud_sim_vk.dll",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "Cloud gaming simulator: delayed frames, turned by the mouse",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    }
+  }
+}

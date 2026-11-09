@@ -1,0 +1,5 @@
+LIBRARY cloud_sim_vk
+EXPORTS
+	vkNegotiateLoaderLayerInterfaceVersion
+	vkGetInstanceProcAddr
+	vkGetDeviceProcAddr
