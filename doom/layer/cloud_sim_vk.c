@@ -381,6 +381,7 @@ typedef struct img {
 	VkImageLayout layout;            /* after the last submission, by its render passes and barriers */
 	uint64_t draws, total;           /* this frame's draws, all draws */
 	VkAttachmentStoreOp store;       /* the depth store op of the last render pass seen with it */
+	VkSharingMode sharing;           /* as made: exclusive (one family) or concurrent */
 	int dead;
 	struct img *next_all;
 } img_t;
@@ -494,6 +495,19 @@ typedef struct sim {
 	int demo_ok, demo_left, demo_total, demo_got, demo_at[MAX_IMAGES], demo_m[MAX_IMAGES];
 	LONGLONG demo_q[MAX_IMAGES];
 	uint32_t demo_fl[MAX_IMAGES];
+	/* A present family without graphics (DOOM presents from its compute queue; Vulkan copies depth only on
+	 * queues with graphics): the game's depth is copied on its own graphics queue into gstage[i] (gcopy),
+	 * and our work on the present queue waits for that (gsem[i]) and takes it into the ring, so the ring
+	 * is still written on the present queue only */
+	VkQueue gqueue;
+	uint32_t gfamily;
+	VkCommandPool gpool;
+	VkCommandBuffer gcmd[MAX_IMAGES];
+	VkFence gfence[MAX_IMAGES];
+	VkSemaphore gsem[MAX_IMAGES];
+	buf_t gstage[MAX_IMAGES];
+	VkDeviceSize gbytes[MAX_IMAGES];
+	int gused[MAX_IMAGES], gsig[MAX_IMAGES];   /* a copy submitted (its fence to wait); gsem signalled, not yet waited */
 } sim_t;
 
 typedef struct device {
@@ -514,6 +528,9 @@ typedef struct device {
 static SRWLOCK obj_lock = SRWLOCK_INIT;      /* the maps below but cmds */
 static SRWLOCK cmd_lock = SRWLOCK_INIT;      /* cmds */
 static SRWLOCK sub_lock = SRWLOCK_INIT;      /* img_t layout and draws */
+/* Queue submits, the game's and ours: the layer submits to the game's graphics queue too (gcopy), and the
+ * submits to one queue must not overlap; taken before sub_lock */
+static SRWLOCK q_lock = SRWLOCK_INIT;
 static map_t insts, devs, queues, images, views, fbs, rps, swapchains, cmds;
 static device_t *only_dev;
 static img_t *all_imgs;                      /* every img_t ever made: freed with nothing */
@@ -712,6 +729,9 @@ static VKAPI_ATTR void VKAPI_CALL h_DestroyDevice(VkDevice device, const VkAlloc
 	if (!d) return;
 	sim_release(d, &d->sim, 1);
 	AcquireSRWLockExclusive(&obj_lock);
+	for (size_t i = 0; i < queues.cap; i++)      /* its queues go with it (graphics_queue reads through them) */
+		if (queues.st[i] == 1 && dkey_of((const void *)(uintptr_t)queues.k[i]) == d->key)
+			queues.st[i] = 2, queues.n--, queues.dead++;
 	map_del(&devs, H64(d->key));
 	ndevs--;
 	only_dev = NULL;
@@ -770,6 +790,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL h_CreateImage(VkDevice device, const VkIma
 	if (!img) return r;
 	img->image = *out, img->format = ci->format, img->extent = ci->extent, img->usage = c.usage;
 	img->aspect = aspects_of(ci->format), img->layout = ci->initialLayout, img->store = VK_ATTACHMENT_STORE_OP_STORE;
+	img->sharing = ci->sharingMode;
 	AcquireSRWLockExclusive(&obj_lock);
 	map_put(&images, H64(*out), img);
 	img->next_all = all_imgs;
@@ -994,6 +1015,7 @@ static VKAPI_ATTR void VKAPI_CALL h_CmdPipelineBarrier(VkCommandBuffer cb, VkPip
 static VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInfo *si, VkFence fence)
 {
 	device_t *d = dev_of(queue);
+	AcquireSRWLockExclusive(&q_lock);            /* the layouts below hold from here to the submit */
 	AcquireSRWLockExclusive(&sub_lock);
 	AcquireSRWLockShared(&cmd_lock);
 	for (uint32_t i = 0; i < n; i++)
@@ -1009,7 +1031,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue queue, uint32_t n, c
 		}
 	ReleaseSRWLockShared(&cmd_lock);
 	ReleaseSRWLockExclusive(&sub_lock);
-	return d->QueueSubmit(queue, n, si, fence);
+	VkResult r = d->QueueSubmit(queue, n, si, fence);
+	ReleaseSRWLockExclusive(&q_lock);
+	return r;
 }
 
 /* ---------------------------------------------------------------- swapchains */
@@ -1074,13 +1098,17 @@ static uint32_t memtype(device_t *d, uint32_t bits, VkMemoryPropertyFlags want)
 	return UINT32_MAX;
 }
 
-static int make_buf(device_t *d, buf_t *b, VkDeviceSize size, int host)
+/* a buffer, shared by two queue families when f0 != f1 (concurrent: no ownership transfers) */
+static int make_buf_in(device_t *d, buf_t *b, VkDeviceSize size, int host, uint32_t f0, uint32_t f1)
 {
 	VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
 	bi.size = size ? size : 256;
 	bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
 		   | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	uint32_t fams[2] = { f0, f1 };
+	bi.sharingMode = f0 != f1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+	bi.queueFamilyIndexCount = f0 != f1 ? 2u : 0u;
+	bi.pQueueFamilyIndices = f0 != f1 ? fams : NULL;
 	if (d->CreateBuffer(d->handle, &bi, NULL, &b->b) != VK_SUCCESS) return 0;
 	VkMemoryRequirements r;
 	d->GetBufferMemoryRequirements(d->handle, b->b, &r);
@@ -1107,6 +1135,11 @@ static int make_buf(device_t *d, buf_t *b, VkDeviceSize size, int host)
 		return 0;
 	}
 	return 1;
+}
+
+static int make_buf(device_t *d, buf_t *b, VkDeviceSize size, int host)
+{
+	return make_buf_in(d, b, size, host, 0, 0);
 }
 
 static void free_buf(device_t *d, buf_t *b)
@@ -1158,12 +1191,29 @@ static void wait_ours(device_t *d, sim_t *s)
 		}
 }
 
+/* the depth copy through the game's graphics queue (a present family without graphics), after wait_ours:
+ * no work of ours waits on a gsem any more */
+static void g_release(device_t *d, sim_t *s)
+{
+	for (uint32_t i = 0; i < MAX_IMAGES; i++) {
+		if (s->gused[i] && s->gfence[i]) d->WaitForFences(d->handle, 1, &s->gfence[i], VK_TRUE, 5000000000ull);
+		if (s->gfence[i]) d->DestroyFence(d->handle, s->gfence[i], NULL);
+		if (s->gsem[i]) d->DestroySemaphore(d->handle, s->gsem[i], NULL);
+		free_buf(d, &s->gstage[i]);
+		s->gfence[i] = VK_NULL_HANDLE, s->gsem[i] = VK_NULL_HANDLE, s->gcmd[i] = VK_NULL_HANDLE;
+		s->gused[i] = s->gsig[i] = 0, s->gbytes[i] = 0;
+	}
+	if (s->gpool) d->DestroyCommandPool(d->handle, s->gpool, NULL);
+	s->gpool = VK_NULL_HANDLE, s->gqueue = VK_NULL_HANDLE, s->gfamily = 0;
+}
+
 /* all 1: the device goes, so the pipelines too; 0: only what the swapchain sized; 2: as 0, but the
  * simulator moves to another queue family of the same swapchain, so the semaphores stay (a present
  * queued on the old queue may still wait on one, and they serve on any queue) */
 static void sim_release(device_t *d, sim_t *s, int all)
 {
 	wait_ours(d, s);
+	g_release(d, s);
 	for (uint32_t i = 0; i < MAX_IMAGES; i++) {
 		if (s->fence[i]) d->DestroyFence(d->handle, s->fence[i], NULL);
 		if (s->sem[i] && all != 2) d->DestroySemaphore(d->handle, s->sem[i], NULL), s->sem[i] = VK_NULL_HANDLE;
@@ -1184,6 +1234,7 @@ static void sim_release(device_t *d, sim_t *s, int all)
 	free_buf(d, &s->zbuf), free_buf(d, &s->out), free_buf(d, &s->fin), free_buf(d, &s->pkeys);
 	free_buf(d, &s->pcolor), free_buf(d, &s->params), free_buf(d, &s->rec), free_buf(d, &s->snap);
 	s->ready = 0, s->sc = NULL, s->frames = 0, s->snap_busy = 0;
+	s->log_frames = 0;                       /* else the next fps line counts from the old frame number */
 	if (s->rec_data) {
 		free(s->rec_data), free(s->rec_qpc), free(s->rec_mode);
 		s->rec_data = NULL, s->rec_qpc = NULL, s->rec_mode = NULL;
@@ -1827,6 +1878,96 @@ static int fmt_ok(VkFormat f, uint32_t *bgra)
 	}
 }
 
+/* a queue the game got on this device in a family with graphics (the lowest such family), or none */
+static VkQueue graphics_queue(device_t *d, const VkQueueFamilyProperties *qf, uint32_t nqf, uint32_t *gf)
+{
+	VkQueue best = VK_NULL_HANDLE;
+	uint32_t bf = UINT32_MAX;
+	AcquireSRWLockShared(&obj_lock);
+	for (size_t i = 0; i < queues.cap; i++) {
+		if (queues.st[i] != 1) continue;
+		VkQueue q = (VkQueue)(uintptr_t)queues.k[i];
+		uint32_t f = (uint32_t)(uintptr_t)queues.v[i] - 1;
+		if (dkey_of(q) != d->key || f >= nqf || !(qf[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+		if (f < bf) bf = f, best = q;
+	}
+	ReleaseSRWLockShared(&obj_lock);
+	*gf = bf;
+	return best;
+}
+
+/* the depth copy through the game's graphics queue gq (family gf): per swapchain image a command buffer,
+ * a fence, a semaphore, and a staging buffer both families share; s->family and s->nimg are set */
+static int g_init(device_t *d, sim_t *s, VkQueue gq, uint32_t gf, VkDeviceSize cap)
+{
+	VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gf };
+	if (d->CreateCommandPool(d->handle, &pci, NULL, &s->gpool) != VK_SUCCESS) {
+		s->gpool = VK_NULL_HANDLE;
+		return 0;
+	}
+	VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->gpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, s->nimg };
+	if (d->AllocateCommandBuffers(d->handle, &cai, s->gcmd) != VK_SUCCESS) return 0;
+	for (uint32_t i = 0; i < s->nimg; i++) {
+		if (d->set_loader_data) d->set_loader_data(d->handle, s->gcmd[i]);
+		else *(void **)s->gcmd[i] = d->key;
+		VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+		VkSemaphoreCreateInfo si = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+		if (d->CreateFence(d->handle, &fi, NULL, &s->gfence[i]) != VK_SUCCESS) {
+			s->gfence[i] = VK_NULL_HANDLE;
+			return 0;
+		}
+		if (d->CreateSemaphore(d->handle, &si, NULL, &s->gsem[i]) != VK_SUCCESS) {
+			s->gsem[i] = VK_NULL_HANDLE;
+			return 0;
+		}
+		if (!make_buf_in(d, &s->gstage[i], cap, 0, s->family, gf)) return 0;
+	}
+	s->gqueue = gq, s->gfamily = gf;
+	return 1;
+}
+
+/* On a present family without graphics, under q_lock: the game's depth (in layout dl) copied on its
+ * graphics queue into gstage[i], after all the game has submitted there (the first barrier's first scope)
+ * and before all it submits later (the second barrier's second scope: its next frame's depth waits for
+ * the copy), and signalled to our work on the present queue by gsem[i]. 1 when it is on its way. */
+static int gcopy(device_t *d, sim_t *s, uint32_t i, img_t *dimg, VkImageLayout dl)
+{
+	if (s->gused[i]) {
+		if (d->WaitForFences(d->handle, 1, &s->gfence[i], VK_TRUE, 2000000000ull) != VK_SUCCESS) return 0;
+		s->gused[i] = 0;
+	}
+	if (s->gsig[i]) {               /* signalled and never waited (our frame stopped after its copy): a new one */
+		d->DestroySemaphore(d->handle, s->gsem[i], NULL);
+		s->gsem[i] = VK_NULL_HANDLE, s->gsig[i] = 0;
+		VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+		if (d->CreateSemaphore(d->handle, &sci, NULL, &s->gsem[i]) != VK_SUCCESS) s->gsem[i] = VK_NULL_HANDLE;
+	}
+	if (!s->gsem[i] || !s->gcmd[i]) return 0;
+	uint32_t w = dimg->extent.width, h = dimg->extent.height;
+	VkDeviceSize bytes = (VkDeviceSize)w * h * (depth_kind(dimg->format) == 4 ? 2 : 4);
+	if (bytes > s->gstage[i].size) return 0;
+	VkCommandBuffer cb = s->gcmd[i];
+	VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
+	if (d->BeginCommandBuffer(cb, &bi) != VK_SUCCESS) return 0;
+	VkImageMemoryBarrier to = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+				    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+				    VK_ACCESS_TRANSFER_READ_BIT, dl, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+				    VK_QUEUE_FAMILY_IGNORED, dimg->image, { dimg->aspect, 0, 1, 0, 1 } };
+	d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to);
+	VkBufferImageCopy dc = { 0, 0, 0, { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, { 0, 0, 0 }, { w, h, 1 } };
+	d->CmdCopyImageToBuffer(cb, dimg->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->gstage[i].b, 1, &dc);
+	VkImageMemoryBarrier back = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_READ_BIT,
+				      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dl,
+				      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, dimg->image, { dimg->aspect, 0, 1, 0, 1 } };
+	d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+	if (d->EndCommandBuffer(cb) != VK_SUCCESS) return 0;
+	d->ResetFences(d->handle, 1, &s->gfence[i]);
+	VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 1, &s->gsem[i] };
+	if (d->QueueSubmit(s->gqueue, 1, &si, s->gfence[i]) != VK_SUCCESS) return 0;
+	s->gused[i] = 1, s->gsig[i] = 1, s->gbytes[i] = bytes;
+	return 1;
+}
+
 static int sim_init(device_t *d, sim_t *s, VkQueue queue, sc_t *sc)
 {
 	AcquireSRWLockShared(&obj_lock);
@@ -1860,13 +2001,23 @@ static int sim_init(device_t *d, sim_t *s, VkQueue queue, sc_t *sc)
 		s->dump_event = CreateEventW(NULL, FALSE, FALSE, name);
 	}
 	s->queue = queue, s->family = family, s->sc = sc;
-	/* Vulkan copies depth only on queues with graphics, and the game's next frame would race a depth
-	 * read on another queue anyway: on a compute-only family the simulator runs without the depth */
+	/* Vulkan copies depth only on queues with graphics: on a family without, the depth is copied on the
+	 * game's own graphics queue (g_init, gcopy), or, with none of those, the simulator runs without it */
 	s->graphics = (qf[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
-	if (!s->graphics && cfg.depth)
-		say("sim: family %u has no graphics: the game's depth is left out there (no weapon mask: the weapon turns with "
-		    "the world; no depth for the move)\n", family);
 	s->W = sc->extent.width, s->H = sc->extent.height, s->nimg = sc->count, s->slots = (uint32_t)cfg.slots;
+	if (!s->graphics && cfg.depth) {
+		uint32_t gf = 0;
+		VkQueue gq = graphics_queue(d, qf, nqf, &gf);
+		if (gq && g_init(d, s, gq, gf, (VkDeviceSize)s->W * s->H * 4)) {
+			say("sim: family %u has no graphics: the game's depth is copied on its graphics queue (family %u) and handed "
+			    "over by a semaphore\n", family, gf);
+		} else {
+			g_release(d, s);
+			say("sim: family %u has no graphics (%s): the game's depth is left out there (no weapon mask: the weapon turns "
+			    "with the world; no depth for the move)\n", family,
+			    gq ? "the copy through its graphics queue could not be set up" : "and no graphics queue of the game's");
+		}
+	}
 	VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family };
 	if (d->CreateCommandPool(d->handle, &pci, NULL, &s->pool) != VK_SUCCESS) return 0;
 	s->ts_ok = 0, s->ts_sum_ms = s->ts_max_ms = 0.0, s->ts_n = 0, s->ts_stride = 4 + PROF_MAX, s->prof_img = -1;
@@ -1908,6 +2059,7 @@ static int sim_init(device_t *d, sim_t *s, VkQueue queue, sc_t *sc)
 	s->rec_stride = (s->demo_doff + s->demo_dwords + 63) / 64 * 64;
 	int ok = 1;
 	for (uint32_t k = 0; k < s->slots && ok; k++) ok = make_buf(d, &s->color[k], frame, 0) && make_buf(d, &s->depth[k], s->depth_cap, 0);
+	if (s->gqueue && s->depth_cap > (VkDeviceSize)s->W * s->H * 4) ok = 0;   /* gstage is sized as depth_cap */
 	ok = ok && make_buf(d, &s->zbuf, frame, 0) && make_buf(d, &s->out, frame, 0) && make_buf(d, &s->fin, frame, 0);
 	ok = ok && make_buf(d, &s->pkeys, kb, 0) && make_buf(d, &s->pcolor, cb, 0) && make_buf(d, &s->params, PARAMS_BYTES, 0);
 	ok = ok && make_buf(d, &s->rec, (VkDeviceSize)s->rec_stride * 4 * s->nimg, 1) && make_buf(d, &s->snap, frame * 2, 1);
@@ -2135,8 +2287,9 @@ static img_t *pick_depth(sim_t *s, VkImageLayout *layout)
 	ReleaseSRWLockExclusive(&sub_lock);
 	if (best != s->dimg) {
 		if (best)
-			say("sim: depth buffer %ux%u, format %d, layout %d, store op %d, %llu draws this frame\n", best->extent.width,
-			    best->extent.height, (int)best->format, (int)*layout, (int)best->store, (unsigned long long)most);
+			say("sim: depth buffer %ux%u, format %d, layout %d, store op %d, %s, %llu draws this frame\n", best->extent.width,
+			    best->extent.height, (int)best->format, (int)*layout, (int)best->store,
+			    best->sharing == VK_SHARING_MODE_CONCURRENT ? "concurrent" : "exclusive", (unsigned long long)most);
 		else if (s->dimg)
 			say("sim: no depth buffer this frame\n");
 		s->dimg = best;
@@ -2247,11 +2400,24 @@ static VkSemaphore sim_frame(device_t *d, sim_t *s, VkQueue queue, const VkPrese
 	QueryPerformanceCounter(&now);
 	uint32_t k = (uint32_t)(s->frames % s->slots);
 
-	/* the game's depth */
+	/* the game's depth: copied by our command buffer on the present queue, or, on a family without
+	 * graphics, first on the game's graphics queue (gcopy; q_lock keeps the game's submits from coming
+	 * between the layout read here and that copy) */
 	VkImageLayout dl = VK_IMAGE_LAYOUT_UNDEFINED;
+	int via_g = !s->graphics && s->gqueue && cfg.depth;
+	if (via_g) AcquireSRWLockExclusive(&q_lock);
 	img_t *dimg = cfg.depth ? pick_depth(s, &dl) : NULL;
-	if (!s->graphics) dimg = NULL;           /* a compute-only family: no depth copies (sim_init) */
+	if (!s->graphics && !s->gqueue) dimg = NULL;   /* no graphics here and no copy through the game's (sim_init) */
 	int use_depth = dimg && dl != VK_IMAGE_LAYOUT_UNDEFINED && dl != VK_IMAGE_LAYOUT_PREINITIALIZED;
+	if (via_g) {
+		if (use_depth && !gcopy(d, s, i, dimg, dl)) {
+			use_depth = 0;
+			static int said;
+			if (!said) said = 1, say("sim: the depth copy on the game's graphics queue failed; this frame goes without depth\n");
+		}
+		ReleaseSRWLockExclusive(&q_lock);
+	}
+	int gwait = use_depth && !s->graphics;   /* our work waits for gsem[i] and takes the depth from gstage[i] */
 	uint32_t rev = cfg.reversed >= 0 ? (uint32_t)cfg.reversed : (s->reversed > 0 ? 1u : 0u);
 	s->dok[k] = use_depth;
 	s->drw[k] = use_depth ? dimg->extent.width : 0;
@@ -2387,7 +2553,7 @@ static VkSemaphore sim_frame(device_t *d, sim_t *s, VkQueue queue, const VkPrese
 	ib[nb++] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_READ_BIT,
 					   VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
 					   VK_QUEUE_FAMILY_IGNORED, image, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-	if (use_depth)
+	if (use_depth && !gwait)
 		ib[nb++] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
 						   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
 						   VK_ACCESS_TRANSFER_READ_BIT, dl, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
@@ -2395,7 +2561,10 @@ static VkSemaphore sim_frame(device_t *d, sim_t *s, VkQueue queue, const VkPrese
 	d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, nb, ib);
 	VkBufferImageCopy rc = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { s->W, s->H, 1 } };
 	d->CmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->color[k].b, 1, &rc);
-	if (use_depth) {
+	if (gwait) {                             /* copied on the game's graphics queue; gsem[i] waited at transfer */
+		VkBufferCopy bc = { 0, 0, s->gbytes[i] };
+		d->CmdCopyBuffer(cb, s->gstage[i].b, s->depth[k].b, 1, &bc);
+	} else if (use_depth) {
 		VkBufferImageCopy dc = { 0, 0, 0, { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, { 0, 0, 0 }, { s->drw[k], s->drh[k], 1 } };
 		d->CmdCopyImageToBuffer(cb, dimg->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->depth[k].b, 1, &dc);
 		VkImageMemoryBarrier back = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_READ_BIT,
@@ -2511,11 +2680,16 @@ static VkSemaphore sim_frame(device_t *d, sim_t *s, VkQueue queue, const VkPrese
 		return VK_NULL_HANDLE;
 	}
 
-	VkPipelineStageFlags waits[16];
+	VkSemaphore wsem[17];
+	VkPipelineStageFlags waits[17];
 	uint32_t nw = info->waitSemaphoreCount < 16 ? info->waitSemaphoreCount : 16;
-	for (uint32_t w = 0; w < nw; w++) waits[w] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-	VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nw, info->pWaitSemaphores, waits, 1, &cb, 1, &s->sem[i] };
+	for (uint32_t w = 0; w < nw; w++) wsem[w] = info->pWaitSemaphores[w], waits[w] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	if (gwait) wsem[nw] = s->gsem[i], waits[nw++] = VK_PIPELINE_STAGE_TRANSFER_BIT;   /* the depth from gcopy */
+	VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nw, wsem, waits, 1, &cb, 1, &s->sem[i] };
+	AcquireSRWLockExclusive(&q_lock);
 	VkResult r = d->QueueSubmit(queue, 1, &si, s->fence[i]);
+	ReleaseSRWLockExclusive(&q_lock);
+	if (r == VK_SUCCESS && gwait) s->gsig[i] = 0;
 	if (r != VK_SUCCESS) {
 		say("sim: our submit failed (%d); the simulator stops\n", (int)r);
 		s->failed = 1;

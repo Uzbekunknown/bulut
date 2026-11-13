@@ -21,8 +21,9 @@
  * integrated in small steps, apart from the layer's closed form, so the two check each other.
  *
  * Mode 12 is mode 2 with the frames presented from a compute-only queue family from frame 20 on (the
- * swapchain and the depth shared by both families), as DOOM may present from its compute queue: the
- * layer has to start again on that family and warp as before. */
+ * swapchain shared by both families, the depth drawn on the graphics queue and exclusive to it), as DOOM
+ * presents from its compute queue: the layer has to start again on that family, copy the depth on the
+ * graphics queue, and warp and keep the weapon as before. */
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -365,10 +366,11 @@ int wmain(int argc, wchar_t **argv)
 					     { 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
 		CHECK(vkCreateImageView(dev, &vi, NULL, &views[i]));
 	}
+	/* the depth is drawn on the graphics queue only, so it stays exclusive to that family even in 12 (as a
+	 * game's would): the layer has to copy it there */
 	VkImageCreateInfo dic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_D32_SFLOAT, { W, H, 1 }, 1, 1,
 				  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-				  cq ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE, cq ? 2u : 0u, cq ? both : NULL,
-				  VK_IMAGE_LAYOUT_UNDEFINED };
+				  VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
 	VkImage depth;
 	CHECK(vkCreateImage(dev, &dic, NULL, &depth));
 	VkMemoryRequirements mr;
@@ -732,13 +734,9 @@ int wmain(int argc, wchar_t **argv)
 			printf("FAIL: the frame shown is %.1f ms old, under %d\n", age, latency);
 			fail = 1;
 		}
-		if (cq) {
-			/* on a compute-only family the layer leaves the depth out by design (no depth copies there) */
-			printf("compute-only family: depth %s (none expected); the weapon, snapshot and demo checks need it and are left out\n",
-			       strstr(info, "depth_ok 1") ? "present" : "absent");
-			if (strstr(info, "depth_ok 1")) printf("FAIL: depth on a compute-only family\n"), fail = 1;
-		} else if (!strstr(info, "depth_ok 1")) {
-			printf("FAIL: the layer had no depth\n");
+		/* 12: on the compute-only family the layer copies the depth on the graphics queue (gcopy) */
+		if (!strstr(info, "depth_ok 1")) {
+			printf("FAIL: the layer had no depth%s\n", cq ? " (12: the copy through the graphics queue)" : "");
 			fail = 1;
 		}
 		/* the stripe in row 40 */
@@ -780,11 +778,11 @@ int wmain(int argc, wchar_t **argv)
 		}
 		const unsigned char *wpx = px(out, 512, 330);
 		printf("weapon (512,330): %u %u %u\n", wpx[2], wpx[1], wpx[0]);
-		if (!cq && !near_rgb(wpx, 128, 128, 128, 3)) {
+		if (!near_rgb(wpx, 128, 128, 128, 3)) {
 			printf("FAIL: the weapon moved\n");
 			fail = 1;
 		}
-		if (mode == 2 && !cq) {
+		if (mode == 2) {
 			const unsigned char *h = px(out, 420, 330);
 			printf("behind the weapon (420,330): %u %u %u\n", h[2], h[1], h[0]);
 			if (near_rgb(h, 128, 128, 128, 20)) {
@@ -876,8 +874,6 @@ int wmain(int argc, wchar_t **argv)
 	}
 	if (move) {
 		printf("(the recording, snapshot and demo checks expect the panorama's depth 0.9: left to the other modes)\n");
-	} else if (cq) {
-		if (!rec_ok) printf("FAIL: the recording\n"), fail = 1;
 	} else {
 		if (!rec_ok) printf("FAIL: the recording\n"), fail = 1;
 		if (!snap_ok) printf("FAIL: the snapshot\n"), fail = 1;

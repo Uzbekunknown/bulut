@@ -6,11 +6,17 @@ This repository is the prototype in a real game: a Vulkan layer that makes DOOM 
 
 **Result:** at 100 ms of simulated cloud delay, the p90 camera miss at the centre of a 1080p screen drops from 65–113 px to 2.5–5.4 px (two in-game recordings, cross-validated).
 
+## Status
+
+- **Mouse warp:** measured on in-game recordings (the result above).
+- **Live in DOOM, 14 November 2026** (Intel Arc 140V): the layer ran for 12 minutes and followed the game every time it switched the queue it presents from. In play, DOOM presents from its async compute queue, and Vulkan allows no depth copies there, so the warp had no weapon mask. The layer now copies the depth on the game's own graphics queue and hands it over with a semaphore. The test app checks this (mode 12: the weapon stays in place; Khronos validation with synchronization checks, 0 errors); the next DOOM session checks it in the game.
+- **Gamepad stick and movement keys:** in the layer and checked on synthetic frames; calibration in the game comes next.
+
 ## What is here
 
 | Path | What it does |
 |---|---|
-| `doom/layer/cloud_sim_vk.c` | The layer, `VK_LAYER_UZ_cloud_sim`. Modes: `local` (the game as it is), `cloud` (every frame held back by the delay), `warp` (the old frame turned to where the camera is now, by the mouse). It finds the game's depth buffer to keep the weapon in place. The gamepad's right stick and the movement keys are in too, checked on synthetic frames so far. |
+| `doom/layer/cloud_sim_vk.c` | The layer, `VK_LAYER_UZ_cloud_sim`. Modes: `local` (the game as it is), `cloud` (every frame held back by the delay), `warp` (the old frame turned to where the camera is now, by the mouse). It finds the game's depth buffer to keep the weapon in place, also when the game presents from a compute queue. The gamepad's right stick and the movement keys are in too, checked on synthetic frames so far. |
 | `doom/layer/sim.comp` | The layer's compute shaders: the warp, hole filling, frame history, the move splat, the overlay. |
 | `doom/layer/input_logger.c`, `mouse_shm.h` | Raw mouse, keys and XInput gamepad, timestamped and shared with the layer. |
 | `doom/layer/test_vk_sim.c` | A small Vulkan app that checks the layer's modes against a known camera, optionally under the Khronos validation layer. |
